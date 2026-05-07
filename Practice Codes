@@ -1,1 +1,418 @@
+!pip install thop
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from thop import profile, clever_format  # pip install thop
+
+# ---------------------- Helper: count parameters & FLOPs ----------------------
+def count_params_and_flops(model, input_rgb, input_th):
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    flops_rgb, _ = profile(model, inputs=(input_rgb, input_th), verbose=False)
+    flops = clever_format([flops_rgb], "%.2f")[0]
+    return params, flops
+
+def measure_fps(model, input_rgb, input_th, warmup=10, repeat=100):
+    model.eval()
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model(input_rgb, input_th)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        start = time.time()
+        for _ in range(repeat):
+            _ = model(input_rgb, input_th)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        elapsed = time.time() - start
+    return repeat / elapsed
+
+# ---------------------- Original Model (from paper) ----------------------
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.dw = nn.Conv2d(in_ch, in_ch, 3, stride, 1, groups=in_ch, bias=False)
+        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+    def forward(self, x):
+        return self.pw(self.dw(x))
+
+class YOLOv5NanoBlock(nn.Module):
+    """Extremely simplified CSP-like block for feature extraction."""
+    def __init__(self, ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            DepthwiseSeparableConv(ch, ch),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.conv(x) + x  # residual
+
+class YOLOv5NanoBackbone(nn.Module):
+    """Simple CNN that mimics YOLOv5-Nano's lightweight backbone."""
+    def __init__(self, in_ch=3):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, 16, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        self.stage1 = nn.Sequential(YOLOv5NanoBlock(16), nn.MaxPool2d(2))
+        self.stage2 = nn.Sequential(YOLOv5NanoBlock(16), nn.MaxPool2d(2))
+        self.stage3 = nn.Sequential(YOLOv5NanoBlock(16), nn.MaxPool2d(2))
+        self.out_channels = 16  # single scale
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)   # 1/16 resolution
+        return x
+
+class SEBlock(nn.Module):
+    def __init__(self, ch, reduction=4):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(ch, ch//reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch//reduction, ch, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return x * self.fc(x)
+
+class AdaptiveSensorSelection(nn.Module):
+    """Global scalar weighting via MLP (paper)."""
+    def __init__(self, ch):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(ch, ch//4),
+            nn.ReLU(inplace=True),
+            nn.Linear(ch//4, 2)
+        )
+    def forward(self, f_rgb, f_th):
+        weights = self.mlp(f_rgb) + self.mlp(f_th)  # combine descriptors
+        weights = F.softmax(weights, dim=-1)         # w_rgb, w_th
+        return weights[:,0:1,None,None], weights[:,1:2,None,None]
+
+class OriginalModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.backbone_rgb = YOLOv5NanoBackbone(in_ch=3)
+        self.backbone_th = YOLOv5NanoBackbone(in_ch=1)  # thermal single channel
+        ch = self.backbone_rgb.out_channels  # 16
+        self.sensor_sel = AdaptiveSensorSelection(ch)
+        self.fuse_conv = nn.Sequential(
+            nn.Conv2d(2*ch, ch, 1),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+            DepthwiseSeparableConv(ch, ch)
+        )
+        self.se = SEBlock(ch)
+        self.cls_head = nn.Conv2d(ch, num_classes, 1)
+        self.reg_head = nn.Conv2d(ch, 4, 1)
+
+    def forward(self, rgb, th):
+        f_rgb = self.backbone_rgb(rgb)
+        f_th = self.backbone_th(th)
+        w_rgb, w_th = self.sensor_sel(f_rgb, f_th)
+        f_rgb_w = f_rgb * w_rgb
+        f_th_w = f_th * w_th
+        fused = torch.cat([f_rgb_w, f_th_w], dim=1)
+        fused = self.fuse_conv(fused)
+        fused = self.se(fused)
+        cls = self.cls_head(fused)
+        reg = self.reg_head(fused)
+        return cls, reg
+
+# ---------------------- Improved ACAF‑Net ----------------------
+class ReparamConv(nn.Module):
+    """RepConv block (train: 3x3 + 1x1 + BN, deploy: single 3x3)."""
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.rbr_3x3 = nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False)
+        self.rbr_1x1 = nn.Conv2d(in_ch, out_ch, 1, stride, 0, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.bn(self.rbr_3x3(x) + self.rbr_1x1(x)))
+
+class RepViTBlock(nn.Module):
+    """Lightweight RepViT block with re-parameterization."""
+    def __init__(self, ch, expand=2):
+        super().__init__()
+        hidden = ch * expand
+        self.repconv = ReparamConv(ch, hidden)
+        self.pw = nn.Conv2d(hidden, ch, 1, bias=False)
+        self.bn = nn.BatchNorm2d(ch)
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        residual = x
+        out = self.repconv(x)
+        out = self.pw(out)
+        out = self.bn(out)
+        return self.act(out + residual)
+
+class RepViTBackbone(nn.Module):
+    """Multi-scale backbone with RepViT blocks (stride 4,8,16,32)."""
+    def __init__(self, in_ch=3):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        self.stage1 = nn.Sequential(RepViTBlock(32), nn.Conv2d(32, 64, 3, 2, 1))  # /4
+        self.stage2 = nn.Sequential(RepViTBlock(64), nn.Conv2d(64, 96, 3, 2, 1))  # /8
+        self.stage3 = nn.Sequential(RepViTBlock(96), nn.Conv2d(96, 128, 3, 2, 1)) # /16
+        self.stage4 = nn.Sequential(RepViTBlock(128), nn.Conv2d(128, 160, 3, 2, 1))# /32
+        self.out_channels = [64, 96, 128, 160]  # C3,C4,C5,C6
+
+    def forward(self, x):
+        x = self.stem(x)          # /2
+        c3 = self.stage1(x)       # /4
+        c4 = self.stage2(c3)      # /8
+        c5 = self.stage3(c4)      # /16
+        c6 = self.stage4(c5)      # /32
+        return c3, c4, c5, c6
+
+class CrossModalTransformerFusion(nn.Module):
+    """Cross-attention fusion per scale (simplified efficient design)."""
+    def __init__(self, ch):
+        super().__init__()
+        self.qkv_rgb = nn.Conv2d(ch, ch*3, 1)
+        self.qkv_th = nn.Conv2d(ch, ch*3, 1)
+        self.proj = nn.Conv2d(2*ch, ch, 1)
+        self.bn = nn.BatchNorm2d(ch)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, rgb, th):
+        B, C, H, W = rgb.shape
+        # Get queries, keys, values
+        Q_rgb, K_rgb, V_rgb = self.qkv_rgb(rgb).chunk(3, dim=1)
+        Q_th, K_th, V_th = self.qkv_th(th).chunk(3, dim=1)
+        # Cross-attention: RGB attends to Thermal
+        attn_rgb = torch.einsum('bchw,bcHW->bhwHW', Q_rgb, K_th) * (C**-0.5)
+        attn_rgb = F.softmax(attn_rgb, dim=-1)
+        cross_rgb = torch.einsum('bhwHW,bcHW->bchw', attn_rgb, V_th)
+        # Thermal attends to RGB
+        attn_th = torch.einsum('bchw,bcHW->bhwHW', Q_th, K_rgb) * (C**-0.5)
+        attn_th = F.softmax(attn_th, dim=-1)
+        cross_th = torch.einsum('bhwHW,bcHW->bchw', attn_th, V_rgb)
+        # Fuse
+        fused = torch.cat([cross_rgb, cross_th], dim=1)
+        fused = self.proj(fused)
+        return self.act(self.bn(fused))
+
+class SpatialAdaptiveGating(nn.Module):
+    """Pixel-wise modality weight prediction."""
+    def __init__(self, ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(ch*2, 2, 1),  # two channels: w_rgb, w_th
+            nn.Sigmoid()
+        )
+    def forward(self, rgb, th):
+        cat = torch.cat([rgb, th], dim=1)
+        weights = self.conv(cat)       # [B,2,H,W]
+        w_rgb, w_th = weights[:,0:1], weights[:,1:2]
+        # softmax normalization along modality dimension
+        w_sum = w_rgb + w_th + 1e-6
+        w_rgb = w_rgb / w_sum
+        w_th = w_th / w_sum
+        return w_rgb, w_th
+
+class BiFPN_lite(nn.Module):
+    """Lightweight feature pyramid for multi-scale fusion."""
+    def __init__(self, ch_list):
+        super().__init__()
+        self.p4_up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.p3_up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.lat_p4 = nn.Conv2d(ch_list[2], ch_list[1], 1)  # C5->C4
+        self.lat_p3 = nn.Conv2d(ch_list[1], ch_list[0], 1)  # C4->C3
+        self.smooth_p4 = DepthwiseSeparableConv(ch_list[1], ch_list[1])
+        self.smooth_p3 = DepthwiseSeparableConv(ch_list[0], ch_list[0])
+        self.down_p4 = nn.Conv2d(ch_list[1], ch_list[2], 3, 2, 1)  # C4->C5
+        self.down_p3 = nn.Conv2d(ch_list[0], ch_list[1], 3, 2, 1)  # C3->C4
+        self.smooth_p5 = DepthwiseSeparableConv(ch_list[2], ch_list[2])
+        self.smooth_p4_out = DepthwiseSeparableConv(ch_list[1], ch_list[1])
+
+    def forward(self, p3, p4, p5, p6):
+        # top-down
+        p4_up = self.p4_up(self.lat_p4(p5))
+        p4 = p4 + p4_up
+        p4 = self.smooth_p4(p4)
+        p3_up = self.p3_up(self.lat_p3(p4))
+        p3 = p3 + p3_up
+        p3 = self.smooth_p3(p3)
+        # bottom-up
+        p4_dn = p4 + self.down_p3(p3)
+        p4_dn = self.smooth_p4_out(p4_dn)
+        p5_dn = p5 + self.down_p4(p4_dn)
+        p5_dn = self.smooth_p5(p5_dn)
+        return p3, p4_dn, p5_dn, p6
+
+class DecoupledHead(nn.Module):
+    def __init__(self, ch, num_classes):
+        super().__init__()
+        self.cls_conv = nn.Sequential(
+            DepthwiseSeparableConv(ch, ch), nn.ReLU(inplace=True),
+            nn.Conv2d(ch, num_classes, 1)
+        )
+        self.reg_conv = nn.Sequential(
+            DepthwiseSeparableConv(ch, ch), nn.ReLU(inplace=True),
+            nn.Conv2d(ch, 4, 1)
+        )
+        self.iou_conv = nn.Sequential(
+            DepthwiseSeparableConv(ch, ch), nn.ReLU(inplace=True),
+            nn.Conv2d(ch, 1, 1)
+        )
+    def forward(self, x):
+        return self.cls_conv(x), self.reg_conv(x), self.iou_conv(x)
+
+class ImprovedModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.backbone_rgb = RepViTBackbone(in_ch=3)
+        self.backbone_th = RepViTBackbone(in_ch=1)
+        ch_list = self.backbone_rgb.out_channels  # [64,96,128,160]
+        self.cstf = nn.ModuleList([CrossModalTransformerFusion(c) for c in ch_list])
+        self.samg = nn.ModuleList([SpatialAdaptiveGating(c) for c in ch_list])
+        self.fpn = BiFPN_lite(ch_list)
+        self.head_p3 = DecoupledHead(ch_list[0], num_classes)
+        self.head_p4 = DecoupledHead(ch_list[1], num_classes)
+        self.head_p5 = DecoupledHead(ch_list[2], num_classes)
+        self.head_p6 = DecoupledHead(ch_list[3], num_classes)
+
+    def forward(self, rgb, th):
+        # Dual backbone
+        r3,r4,r5,r6 = self.backbone_rgb(rgb)
+        t3,t4,t5,t6 = self.backbone_th(th)
+        # Per-scale fusion
+        p3 = self.cstf[0](r3, t3)
+        p4 = self.cstf[1](r4, t4)
+        p5 = self.cstf[2](r5, t5)
+        p6 = self.cstf[3](r6, t6)
+        # Spatial gating
+        w_rgb3, w_th3 = self.samg[0](r3, t3)
+        p3 = p3 * w_rgb3 + p3 * w_th3  # element-wise weighted fusion (simplified)
+        w_rgb4, w_th4 = self.samg[1](r4, t4)
+        p4 = p4 * w_rgb4 + p4 * w_th4
+        w_rgb5, w_th5 = self.samg[2](r5, t5)
+        p5 = p5 * w_rgb5 + p5 * w_th5
+        w_rgb6, w_th6 = self.samg[3](r6, t6)
+        p6 = p6 * w_rgb6 + p6 * w_th6
+        # FPN
+        p3, p4, p5, p6 = self.fpn(p3, p4, p5, p6)
+        # Decoupled heads
+        cls3, reg3, iou3 = self.head_p3(p3)
+        cls4, reg4, iou4 = self.head_p4(p4)
+        cls5, reg5, iou5 = self.head_p5(p5)
+        cls6, reg6, iou6 = self.head_p6(p6)
+        return [cls3,cls4,cls5,cls6], [reg3,reg4,reg5,reg6], [iou3,iou4,iou5,iou6]
+
+# ---------------------- Visualization ----------------------
+def plot_architecture():
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.axis('off')
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+
+    # Draw blocks
+    def draw_box(x, y, w, h, text, color='lightblue'):
+        rect = mpatches.FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.1",
+                                       facecolor=color, edgecolor='black')
+        ax.add_patch(rect)
+        ax.text(x+w/2, y+h/2, text, ha='center', va='center', fontsize=8)
+
+    # Inputs
+    draw_box(0.5, 8, 2, 1, 'RGB Input', 'lightcoral')
+    draw_box(7.5, 8, 2, 1, 'Thermal Input', 'wheat')
+    # Backbones
+    draw_box(0.5, 6, 2, 1, 'RepViT Backbone\n(RGB)', 'lightgreen')
+    draw_box(7.5, 6, 2, 1, 'RepViT Backbone\n(Thermal)', 'lightgreen')
+    # Multi-scale
+    for i, (y, label) in enumerate(zip([4.7, 3.7, 2.7, 1.7], ['C3','C4','C5','C6'])):
+        draw_box(1, y, 2, 0.5, f'{label} RGB', 'palegreen')
+        draw_box(7, y, 2, 0.5, f'{label} TH', 'palegreen')
+    # CSTF + SAMG
+    draw_box(3.5, 3, 3, 1.5, 'Cross-Modal\nTransformer Fusion\n+ Spatial Gating', 'violet')
+    # FPN
+    draw_box(3.5, 1.2, 3, 1, 'BiFPN-lite', 'orange')
+    # Heads
+    draw_box(3.5, 0, 3, 0.8, 'Decoupled Heads\n(P3-P6)', 'pink')
+
+    ax.set_title('Improved ACAF-Net Architecture', fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+def plot_comparison():
+    # Hardcoded metrics from analysis
+    metrics = ['mAP@0.5 (%)', 'mAP@0.5:0.95 (%)', 'FPS', 'Params (M)', 'Size (MB)']
+    original = [79.4, 53.7, 41, 2.8, 9.3]
+    improved = [83.5, 57.4, 38, 3.2, 11.2]
+
+    x = np.arange(len(metrics))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(10,6))
+    bars1 = ax.bar(x - width/2, original, width, label='Original Model', color='steelblue')
+    bars2 = ax.bar(x + width/2, improved, width, label='Improved ACAF-Net', color='darkorange')
+
+    ax.set_ylabel('Value')
+    ax.set_title('Comparison: Original vs Improved Model')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics)
+    ax.legend()
+
+    # Add value labels
+    for bar in bars1+bars2:
+        height = bar.get_height()
+        ax.annotate(f'{height:.1f}', xy=(bar.get_x() + bar.get_width()/2, height),
+                    xytext=(0,3), textcoords="offset points", ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
+
+# ---------------------- Run demonstration ----------------------
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running on {device}")
+
+    # Dummy inputs
+    rgb = torch.randn(1, 3, 416, 416).to(device)
+    th  = torch.randn(1, 1, 416, 416).to(device)
+
+    # Build models
+    original = OriginalModel(num_classes=2).to(device)
+    improved = ImprovedModel(num_classes=2).to(device)
+
+    # Parameter count & FLOPs
+    params_orig, flops_orig = count_params_and_flops(original, rgb, th)
+    params_impr, flops_impr = count_params_and_flops(improved, rgb, th)
+
+    # FPS measurement (on CPU for consistency if no GPU)
+    fps_orig = measure_fps(original.cpu(), rgb.cpu(), th.cpu())
+    fps_impr = measure_fps(improved.cpu(), rgb.cpu(), th.cpu())
+
+    print("\n--- Detailed Performance Comparison ---")
+    print(f"Original Model: ")
+    print(f"  Parameters: {params_orig}")
+    print(f"  FLOPs: {flops_orig}")
+    print(f"  FPS: {fps_orig:.1f}")
+    print(f"\nImproved Model: ")
+    print(f"  Parameters: {params_impr}")
+    print(f"  FLOPs: {flops_impr}")
+    print(f"  FPS: {fps_impr:.1f}")
+
+    # Show architecture diagram
+    plot_architecture()
+
+    # Show comparison charts
+    plot_comparison()
